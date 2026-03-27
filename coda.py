@@ -2921,7 +2921,7 @@ def render_conversion_tab(
     with ctl2:
         uploaded_files = st.file_uploader(
             upload_label,
-            type=["sql", "txt", "zip"],
+            type=["sql", "zip"],
             accept_multiple_files=True,
             key=f"{tab_key}_uploader",
             label_visibility="collapsed"
@@ -3373,7 +3373,7 @@ with tab1:
         obj_type     = "TABLE",
         convert_fn   = convert_ddl_to_snowflake,
         save_type    = "TABLE_DDL",
-        upload_label = "Drop or browse Table DDL files (.sql / .txt)",
+        upload_label = "Drop or browse Table DDL files (.sql / .zip)",
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3413,8 +3413,8 @@ with tab2:
             _v_src_type = st.selectbox("Source Platform", ["SQL Server", "Oracle", "MySQL", "PostgreSQL"], key="view_dbt_platform")
         with _v_ctl2:
             _v_uploaded = st.file_uploader(
-                "Drop or browse View DDL files (.sql / .txt)",
-                type=["sql", "txt", "zip"],
+                "Drop or browse View DDL files (.sql / .zip)",
+                type=["sql", "zip"],
                 accept_multiple_files=True,
                 key="view_dbt_uploader",
                 label_visibility="collapsed"
@@ -3504,7 +3504,7 @@ with tab3:
         obj_type     = "FUNCTION",
         convert_fn   = convert_udf_to_snowflake,
         save_type    = "FUNCTION",
-        upload_label = "Drop or browse UDF / User Function files (.sql / .txt)",
+        upload_label = "Drop or browse UDF / User Function files (.sql / .zip)",
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3517,7 +3517,7 @@ with tab4:
         obj_type     = "PROCEDURE",
         convert_fn   = convert_sp_to_snowflake,
         save_type    = "STORED_PROCEDURE",
-        upload_label = "Drop or browse Stored Procedure files (.sql / .txt)",
+        upload_label = "Drop or browse Stored Procedure files (.sql / .zip)",
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3822,7 +3822,7 @@ with tab5:
     with up_col:
         uploaded_dbt_files = st.file_uploader(
             "Drop or browse procedure files",
-            type=['sql', 'txt', 'zip'],
+            type=['sql', 'zip'],
             accept_multiple_files=True,
             key="dbt_sp_upload",
         )
@@ -4198,7 +4198,7 @@ with tab5:
 # TAB 6: EXECUTE DBT
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab6:
-    st.markdown('<div class="tab-info"><span class="info-icon">ℹ️</span>Deploy your generated dbt project to a Snowflake stage, then run <b>dbt build</b>, <b>dbt test</b>, or <b>dbt docs</b> directly from the app.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="tab-info"><span class="info-icon">ℹ️</span>Deploy your generated dbt project to a Snowflake stage, then run <b>dbt run</b>, <b>dbt test</b>, or <b>dbt docs</b> directly from the app.</div>', unsafe_allow_html=True)
     # ── Resolved stage info banner (read-only, no user input) ────────────────
     dbt_stage_path = st.session_state.get("dbt_stage", "")
     stage_ready    = st.session_state.get("dbt_stage_ready", False)
@@ -4252,8 +4252,8 @@ with tab6:
         _current_fingerprint = {fp: hash(content) for fp, content in project_files.items()}
         _uploaded_fingerprint = st.session_state.get("_uploaded_file_fingerprint", {})
         _changed_files = [fp for fp, h in _current_fingerprint.items() if _uploaded_fingerprint.get(fp) != h]
-      ##  if _changed_files:
-          ##  st.caption(f"{len(_changed_files)} file(s) to upload")
+        if _changed_files:
+            pass
         
         upload_disabled = not stage_ready or not _changed_files
         upload_type = "primary" if _changed_files else "secondary"
@@ -4352,8 +4352,11 @@ with tab6:
     st.markdown("**Execute**")
 
     deploy_disabled = not st.session_state.get("stage_upload_done", False)
+    _has_heal = bool(st.session_state.get("dbt_heal_suggestions"))
     if deploy_disabled:
         st.caption("⚠️ Upload files to stage first before deploying or running.")
+    if _has_heal:
+        st.caption("⚡ Auto-heal suggestions pending — review below before running again.")
 
     heal_col1, heal_col2 = st.columns([1, 1])
     with heal_col1:
@@ -4474,7 +4477,7 @@ with tab6:
 
     # ── dbt run ───────────────────────────────────────────────────────────────
     with col2:
-        if st.button(":material/play_circle: dbt run", type="primary", disabled=deploy_disabled, key="btn_run"):
+        if st.button(":material/play_circle: dbt run", type="primary", disabled=deploy_disabled or _has_heal, key="btn_run"):
             with st.spinner("Running dbt models..."):
                 try:
                     _, _, project_name, task_name, curr_wh = _get_project_and_task(dbt_stage_path)
@@ -4981,218 +4984,6 @@ def run(session, stage_name, rel_path):
         import streamlit.components.v1 as components
         if _display_html:
             components.html(_display_html, height=1000, scrolling=True)
-
-    # ── Cortex Test Data Generator ─────────────────────────────────────────
-    _has_dbt_files = bool(st.session_state.get("dbt_project_files"))
-    if _has_dbt_files:
-        st.divider()
-        st.markdown("""
-        <div class="section-header">
-            <span class="section-icon">🧪</span>
-            <h3 class="section-title">Cortex Test Data Generator</h3>
-        </div>""", unsafe_allow_html=True)
-        st.caption("Generate synthetic test data for source tables using Cortex AI so dbt tests can pass (or intentionally fail).")
-
-        td_col1, td_col2, td_col3 = st.columns([1, 1, 1])
-        with td_col1:
-            test_data_mode = st.selectbox(
-                "Test Data Mode",
-                ["All Pass ✅", "All Fail ❌", "Mixed ⚠️"],
-                key="test_data_mode",
-                help="All Pass: data satisfies every dbt test. All Fail: violates every test. Mixed: some pass, some fail."
-            )
-        with td_col2:
-            test_data_rows = st.select_slider(
-                "Rows per table",
-                options=[5, 10, 20, 50],
-                value=10,
-                key="test_data_rows",
-            )
-        with td_col3:
-            st.markdown("<br>", unsafe_allow_html=True)
-            generate_test_data = st.button(
-                "🧪 Generate Test Data",
-                key="btn_gen_test_data",
-                type="primary",
-                disabled=not stage_ready,
-            )
-
-        if generate_test_data:
-            project_files = st.session_state.get("dbt_project_files", {})
-            _sources_yml = ""
-            _schema_ymls = []
-            _model_sqls = {}
-            for fp, content in project_files.items():
-                fname = fp.split("/")[-1]
-                if fname == "sources.yml":
-                    _sources_yml = content
-                elif fname == "schema.yml":
-                    _schema_ymls.append(content)
-                elif fname.endswith(".sql"):
-                    _model_sqls[fp] = content
-
-            if not _sources_yml:
-                st.warning("No sources.yml found in project files. Cannot determine source tables.")
-            else:
-                _mode_map = {
-                    "All Pass ✅": "ALL_PASS",
-                    "All Fail ❌": "ALL_FAIL",
-                    "Mixed ⚠️": "MIXED",
-                }
-                _mode = _mode_map.get(test_data_mode, "ALL_PASS")
-
-                _mode_instructions = {
-                    "ALL_PASS": "Generate data that will SATISFY ALL dbt tests (not_null columns must have values, unique columns must have distinct values, accepted_values must match, relationships must be valid). Respect all NOT NULL constraints on physical tables.",
-                    "ALL_FAIL": "Generate data that will VIOLATE EVERY dbt test. Include NULLs for columns with not_null dbt tests, duplicate values for unique tests, invalid values for accepted_values, broken foreign keys. The app will automatically drop NOT NULL constraints before inserting, so you CAN use NULL values freely.",
-                    "MIXED": "Generate data where approximately HALF the tests pass and HALF fail. Include some NULLs, some duplicates, some invalid values. The app will automatically drop NOT NULL constraints before inserting, so you CAN use NULL values freely.",
-                }
-
-                _source_ddls = ""
-                try:
-                    _src_data = yaml.safe_load(_sources_yml) or {}
-                    _src_list = _src_data.get("sources", [])
-                    if _src_list:
-                        _src_db = _src_list[0].get("database", "")
-                        _src_schema = _src_list[0].get("schema", "")
-                        _tables = [t.get("name", "") for t in _src_list[0].get("tables", [])]
-                        for _tbl in _tables[:10]:
-                            if _tbl:
-                                try:
-                                    _ddl_rows = session.sql(f"SELECT GET_DDL('TABLE', '{_src_db}.{_src_schema}.{_tbl}') AS DDL").collect()
-                                    if _ddl_rows:
-                                        _source_ddls += f"\n-- {_tbl}\n{_ddl_rows[0]['DDL']}\n"
-                                except Exception:
-                                    pass
-                except Exception:
-                    pass
-
-                _schema_context = "\n---\n".join(_schema_ymls[:3])
-
-                _bronze_models = ""
-                for fp, sql in _model_sqls.items():
-                    if "/staging/" in fp or "/bronze/" in fp:
-                        _bronze_models += f"\n-- File: {fp}\n{sql}\n"
-
-                _prompt = f"""You are a Snowflake SQL expert. Generate INSERT statements to populate source tables with synthetic test data.
-
-SOURCES.YML (defines source tables, database, schema):
-{_sources_yml[:3000]}
-
-SOURCE TABLE DDLs (shows NOT NULL constraints — you MUST respect these):
-{_source_ddls[:4000]}
-
-SCHEMA.YML (defines dbt tests - not_null, unique, accepted_values, relationships):
-{_schema_context[:4000]}
-
-BRONZE/STAGING MODELS (shows column types and CASTs):
-{_bronze_models[:4000]}
-
-CRITICAL RULES:
-- NEVER insert NULL into a column that has a NOT NULL constraint in the table DDL — Snowflake will reject the INSERT
-- Every column value must be compatible with its data type in the DDL
-- For hash columns, generate realistic 128-char hex strings
-
-{_mode_instructions[_mode]}
-
-- Generate exactly {test_data_rows} rows per source table
-- Use INSERT INTO with fully qualified table names from sources.yml (database.schema.table_name)
-- Include all columns referenced in the staging models
-- Use realistic-looking data (addresses, names, IDs, etc.)
-- For hash columns, generate realistic SHA-512 hex strings (128 chars)
-- Wrap each table's INSERT in a separate statement
-- Return ONLY the SQL INSERT statements — no explanation, no markdown fences
-
-OUTPUT FORMAT:
-INSERT INTO database.schema.table1 (col1, col2, ...) VALUES
-(val1, val2, ...),
-(val1, val2, ...);
-
-INSERT INTO database.schema.table2 ...;"""
-
-                with st.spinner(f"🧪 Generating {_mode.lower().replace('_', ' ')} test data via Cortex AI..."):
-                    try:
-                        _escaped = _prompt.replace("'", "''")
-                        _result = session.sql(f"""
-                            SELECT SNOWFLAKE.CORTEX.COMPLETE('claude-opus-4-5', '{_escaped}') as response
-                        """).collect()
-                        _test_sql = clean_sql_response(_result[0]['RESPONSE'].strip())
-                        st.session_state["generated_test_data"] = _test_sql
-                        st.session_state["test_data_executed"] = False
-                    except Exception as tde:
-                        st.error(f"Test data generation failed: {tde}")
-
-        _gen_sql = st.session_state.get("generated_test_data", "")
-        if _gen_sql:
-            st.markdown("**Generated SQL**")
-            st.code(_gen_sql, language="sql")
-
-            exec_col1, exec_col2 = st.columns(2)
-            with exec_col1:
-                if st.button("▶️ Execute INSERT Statements", key="btn_exec_test_data", type="primary"):
-                    _mode = st.session_state.get("test_data_mode", "All Pass ✅")
-                    _needs_nullable = _mode in ("All Fail ❌", "Mixed ⚠️")
-                    _altered_cols = []
-                    if _needs_nullable:
-                        try:
-                            _src_data = yaml.safe_load(st.session_state.get("dbt_project_files", {}).get(
-                                next((fp for fp in st.session_state.get("dbt_project_files", {}) if fp.endswith("sources.yml")), ""), "")) or {}
-                            _src_list = _src_data.get("sources", [])
-                            if _src_list:
-                                _src_db = _src_list[0].get("database", "")
-                                _src_schema = _src_list[0].get("schema", "")
-                                for _tbl_entry in _src_list[0].get("tables", []):
-                                    _tbl = _tbl_entry.get("name", "")
-                                    if _tbl:
-                                        try:
-                                            _col_rows = session.sql(f"""
-                                                SELECT COLUMN_NAME, IS_NULLABLE
-                                                FROM "{_src_db}".INFORMATION_SCHEMA.COLUMNS
-                                                WHERE TABLE_SCHEMA = '{_src_schema}' AND TABLE_NAME = '{_tbl}'
-                                                AND IS_NULLABLE = 'NO'
-                                            """).collect()
-                                            for _cr in _col_rows:
-                                                _cn = _cr["COLUMN_NAME"]
-                                                try:
-                                                    session.sql(f'ALTER TABLE "{_src_db}"."{_src_schema}"."{_tbl}" ALTER COLUMN "{_cn}" DROP NOT NULL').collect()
-                                                    _altered_cols.append(f"{_tbl}.{_cn}")
-                                                except Exception:
-                                                    pass
-                                        except Exception:
-                                            pass
-                        except Exception:
-                            pass
-                        if _altered_cols:
-                            st.caption(f"Temporarily dropped NOT NULL on {len(_altered_cols)} column(s) to allow test data insertion.")
-
-                    _stmts = [s.strip() for s in _gen_sql.split(";") if s.strip()]
-                    _ok = 0
-                    _fail = 0
-                    _errors = []
-                    _prog = st.progress(0, text="Inserting test data...")
-                    for si, stmt in enumerate(_stmts):
-                        if not stmt.upper().startswith("INSERT"):
-                            continue
-                        try:
-                            session.sql(stmt).collect()
-                            _ok += 1
-                        except Exception as ie:
-                            _fail += 1
-                            _errors.append(f"Statement {si+1}: {str(ie)[:200]}")
-                        _prog.progress((si + 1) / len(_stmts), text=f"Executing {si+1}/{len(_stmts)}...")
-                    _prog.empty()
-                    if _fail == 0:
-                        show_toast(f"All {_ok} INSERT statements executed successfully!", "success")
-                        st.session_state["test_data_executed"] = True
-                    else:
-                        show_toast(f"{_ok} succeeded, {_fail} failed", "info", "⚠️")
-                        with st.expander("Insert Errors", expanded=True):
-                            for err in _errors:
-                                st.error(err)
-            with exec_col2:
-                if st.button("🗑️ Clear Generated SQL", key="btn_clear_test_data"):
-                    st.session_state.pop("generated_test_data", None)
-                    st.session_state.pop("test_data_executed", None)
-                    st.rerun()
 
     # ── dbt Auto-Heal Re-run Result (persisted across rerun) ─────────────────
     _heal_rerun_result = st.session_state.pop("dbt_heal_rerun_result", None)
