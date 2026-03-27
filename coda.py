@@ -4275,11 +4275,10 @@ with tab6:
                 stage_target = f"{dbt_stage_path}/{stage_folder}" if stage_folder else dbt_stage_path
         
                 try:
-                    # ── Determine final content to upload ──────────────────────
+                    existing_on_stage = read_file_from_stage(dbt_stage_path, file_path)
+        
                     if file_name in KEEP_IF_EXISTS:
-                        # Check if already on stage — if yes skip entirely
-                        existing = read_file_from_stage(dbt_stage_path, file_path)
-                        if existing is not None:
+                        if existing_on_stage is not None:
                             upload_results.append({
                                 "file":   file_path,
                                 "status": "⏭️ skipped (kept existing)"
@@ -4287,17 +4286,24 @@ with tab6:
                             progress.progress((idx + 1) / len(project_files),
                                               text=f"Skipping {file_path}...")
                             continue
-                        final_content = content  # First time — upload as new
+                        final_content = content
         
                     elif file_name in MERGE_YAML:
-                        # Download existing from stage and merge
                         final_content = merge_yaml_with_stage(dbt_stage_path, file_path, content)
         
                     else:
-                        # .sql and everything else — always take latest
                         final_content = content
         
-                    # ── Upload ─────────────────────────────────────────────────
+                    if existing_on_stage is not None and file_name not in MERGE_YAML:
+                        if existing_on_stage.strip() == final_content.strip():
+                            upload_results.append({
+                                "file":   file_path,
+                                "status": "⏭️ skipped (no change)"
+                            })
+                            progress.progress((idx + 1) / len(project_files),
+                                              text=f"Skipping {file_path}...")
+                            continue
+        
                     file_buffer = io.BytesIO(final_content.encode("utf-8"))
                     session.file.put_stream(
                         input_stream   = file_buffer,
@@ -4307,11 +4313,18 @@ with tab6:
                     )
         
                     if file_name in MERGE_YAML:
-                        existing_on_stage = read_file_from_stage(dbt_stage_path, file_path)
-                        action = "merged" if existing_on_stage is not None else "uploaded"
+                        if existing_on_stage is None:
+                            action = "uploaded"
+                        elif existing_on_stage.strip() == final_content.strip():
+                            action = "skipped (no change)"
+                        else:
+                            action = "merged"
+                    elif existing_on_stage is not None:
+                        action = "updated"
                     else:
                         action = "uploaded"
-                    upload_results.append({"file": file_path, "status": f"✅ {action}"})
+                    _icon = "⏭️" if "skipped" in action else "✅"
+                    upload_results.append({"file": file_path, "status": f"{_icon} {action}"})
         
                 except Exception as e:
                     upload_results.append({"file": file_path, "status": f"❌ {str(e)[:80]}"})
@@ -4323,22 +4336,35 @@ with tab6:
         
             # ── Summary ────────────────────────────────────────────────────────
             uploaded = sum(1 for r in upload_results if "✅ uploaded" in r["status"])
+            updated  = sum(1 for r in upload_results if "✅ updated"  in r["status"])
             merged   = sum(1 for r in upload_results if "✅ merged"   in r["status"])
             skipped  = sum(1 for r in upload_results if "⏭️"          in r["status"])
             failed   = sum(1 for r in upload_results if "❌"          in r["status"])
         
-            if failed == 0:
-                st.markdown(
-                    f"Done — {uploaded} uploaded · {merged} merged · {skipped} skipped"
-                )
-            else:
-                st.warning(
-                    f"{uploaded} uploaded · {merged} merged · {skipped} skipped · {failed} failed"
-                )
+            parts_summary = []
+            if uploaded: parts_summary.append(f"{uploaded} uploaded")
+            if updated:  parts_summary.append(f"{updated} updated")
+            if merged:   parts_summary.append(f"{merged} merged")
+            if skipped:  parts_summary.append(f"{skipped} skipped")
+            if failed:   parts_summary.append(f"{failed} failed")
+            summary_text = " · ".join(parts_summary) if parts_summary else "No files processed"
         
-            with st.expander("Upload Details", expanded=(failed > 0)):
-                for r in upload_results:
+            if failed == 0:
+                st.markdown(f"Done — {summary_text}")
+            else:
+                st.warning(summary_text)
+        
+            changed_results = [r for r in upload_results if "⏭️" not in r["status"]]
+            skipped_results = [r for r in upload_results if "⏭️" in r["status"]]
+        
+            has_changes = len(changed_results) > 0 or failed > 0
+            with st.expander("Upload Details", expanded=has_changes):
+                for r in changed_results:
                     st.markdown(f"`{r['file']}` → {r['status']}")
+                if skipped_results:
+                    with st.expander(f"⏭️ {len(skipped_results)} files skipped (no change)"):
+                        for r in skipped_results:
+                            st.markdown(f"`{r['file']}` → {r['status']}")
         
             st.session_state.stage_upload_done = True
             st.session_state["_uploaded_file_fingerprint"] = {fp: hash(content) for fp, content in project_files.items()}
@@ -4375,6 +4401,10 @@ with tab6:
             disabled=not dbt_auto_heal_enabled,
             help="Number of Cortex retry attempts per failed model."
         )
+
+    for key in ["_exec_deploy", "_exec_run", "_exec_test", "_exec_docs"]:
+        if key not in st.session_state:
+            st.session_state[key] = False
 
     col1, col2, col3, col4 = st.columns(4)
 
@@ -4459,37 +4489,45 @@ with tab6:
 
     # ── Deploy Project ───────────────────────────────────────────────────────
     with col1:
-        if st.button(":material/inventory: Deploy Project", type="primary", disabled=deploy_disabled, key="btn_deploy"):
-            with st.spinner("Deploying project..."):
-                try:
-                    db, schema, project_name, _, _ = _get_project_and_task(dbt_stage_path)
-                    session.sql("""
-                        CREATE OR REPLACE DBT PROJECT {project_name}
-                        FROM '{stage_path}'
-                    """.format(
-                        project_name = project_name,
-                        stage_path   = dbt_stage_path      # <-- now wrapped in quotes inside the SQL
-                    )).collect()
-                    st.markdown(f"Project deployed: `{project_name}`")
-                    st.session_state.project_deployed = True
-                except Exception as e:
-                    st.error(str(e))
+        if st.button(":material/inventory: Deploy Project", type="primary", disabled=deploy_disabled or st.session_state["_exec_deploy"], key="btn_deploy"):
+            st.session_state["_exec_deploy"] = True
+            st.rerun()
+    if st.session_state["_exec_deploy"]:
+        with st.spinner("Deploying project..."):
+            try:
+                db, schema, project_name, _, _ = _get_project_and_task(dbt_stage_path)
+                session.sql("""
+                    CREATE OR REPLACE DBT PROJECT {project_name}
+                    FROM '{stage_path}'
+                """.format(
+                    project_name = project_name,
+                    stage_path   = dbt_stage_path
+                )).collect()
+                st.markdown(f"Project deployed: `{project_name}`")
+                st.session_state.project_deployed = True
+            except Exception as e:
+                st.error(str(e))
+            finally:
+                st.session_state["_exec_deploy"] = False
 
     # ── dbt run ───────────────────────────────────────────────────────────────
     with col2:
-        if st.button(":material/play_circle: dbt run", type="primary", disabled=deploy_disabled or _has_heal, key="btn_run"):
-            with st.spinner("Running dbt models..."):
-                try:
-                    _, _, project_name, task_name, curr_wh = _get_project_and_task(dbt_stage_path)
-                    state, error = _run_dbt_task(task_name, project_name, curr_wh, "run")
-                    if state == "SUCCEEDED":
-                        st.markdown("dbt run completed ✅")
-                        st.session_state.pop("dbt_heal_suggestions", None)
-                    elif state == "TIMEOUT":
-                        st.warning("Task still running. Check Snowflake task history.")
-                    else:
-                        st.error(f"dbt run failed [{state}]: {error}")
-                        if dbt_auto_heal_enabled:
+        if st.button(":material/play_circle: dbt run", type="primary", disabled=deploy_disabled or _has_heal or st.session_state["_exec_run"], key="btn_run"):
+            st.session_state["_exec_run"] = True
+            st.rerun()
+    if st.session_state["_exec_run"]:
+        with st.spinner("Running dbt models..."):
+            try:
+                _, _, project_name, task_name, curr_wh = _get_project_and_task(dbt_stage_path)
+                state, error = _run_dbt_task(task_name, project_name, curr_wh, "run")
+                if state == "SUCCEEDED":
+                    st.markdown("dbt run completed ✅")
+                    st.session_state.pop("dbt_heal_suggestions", None)
+                elif state == "TIMEOUT":
+                    st.warning("Task still running. Check Snowflake task history.")
+                else:
+                    st.error(f"dbt run failed [{state}]: {error}")
+                    if dbt_auto_heal_enabled:
                             parsed_errors = _parse_dbt_run_errors(error)
                             project_files = st.session_state.get("dbt_project_files", {})
                             if parsed_errors and project_files:
@@ -4555,66 +4593,76 @@ with tab6:
                                                         "approved": False,
                                                     })
                                     st.session_state["dbt_heal_suggestions"] = heal_suggestions
-                except Exception as e:
-                    st.error(str(e))
+            except Exception as e:
+                st.error(str(e))
+            finally:
+                st.session_state["_exec_run"] = False
 
     # ── dbt test ─────────────────────────────────────────────────────────────
     with col3:
-        if st.button(":material/rule: dbt test", type="primary", key="btn_dbt_test", disabled=deploy_disabled):
-            with st.spinner("Running dbt tests..."):
-                try:
-                    _, _, project_name, task_name, curr_wh = _get_project_and_task(dbt_stage_path)
-                    state, error = _run_dbt_task(task_name, project_name, curr_wh, "test")
-                    if state == "SUCCEEDED":
-                        st.markdown("All dbt tests passed ✅")
-                    elif state == "TIMEOUT":
-                        st.warning("Tests still running. Check Snowflake task history.")
-                    else:
-                        st.error(f"dbt test failed [{state}]: {error}")
-                except Exception as e:
-                    st.error(str(e))
+        if st.button(":material/rule: dbt test", type="primary", key="btn_dbt_test", disabled=deploy_disabled or st.session_state["_exec_test"]):
+            st.session_state["_exec_test"] = True
+            st.rerun()
+    if st.session_state["_exec_test"]:
+        with st.spinner("Running dbt tests..."):
+            try:
+                _, _, project_name, task_name, curr_wh = _get_project_and_task(dbt_stage_path)
+                state, error = _run_dbt_task(task_name, project_name, curr_wh, "test")
+                if state == "SUCCEEDED":
+                    st.markdown("All dbt tests passed ✅")
+                elif state == "TIMEOUT":
+                    st.warning("Tests still running. Check Snowflake task history.")
+                else:
+                    st.error(f"dbt test failed [{state}]: {error}")
+            except Exception as e:
+                st.error(str(e))
+            finally:
+                st.session_state["_exec_test"] = False
 
     # ── dbt docs ─────────────────────────────────────────────────────────────
     with col4:
-        if st.button(":material/description: dbt docs", type="primary", key="btn_dbt_docs", disabled=deploy_disabled):
-            with st.spinner("Generating dbt docs..."):
-                try:
-                    db, schema, project_name, task_name, curr_wh = _get_project_and_task(dbt_stage_path)
-                    if not curr_wh:
-                        st.error("No active warehouse. Set a warehouse before generating docs.")
-                    else:
-                        state, error = _run_dbt_task(task_name, project_name, curr_wh, "docs generate")
-                        if state == "SUCCEEDED":
-                            st.markdown("Docs generated. Fetching artifacts...")
-                            try:
-                                task_short = task_name.split(".")[-1]
-                                qid_row = session.sql("""
-                                    SELECT QUERY_ID
-                                    FROM TABLE({db}.INFORMATION_SCHEMA.TASK_HISTORY(
-                                        RESULT_LIMIT => 5,
-                                        TASK_NAME => '{task_short}'
-                                    ))
-                                    WHERE STATE = 'SUCCEEDED'
-                                    ORDER BY SCHEDULED_TIME DESC
-                                    LIMIT 1
-                                """.format(db=db, task_short=task_short)).collect()
+        if st.button(":material/description: dbt docs", type="primary", key="btn_dbt_docs", disabled=deploy_disabled or st.session_state["_exec_docs"]):
+            st.session_state["_exec_docs"] = True
+            st.rerun()
+    if st.session_state["_exec_docs"]:
+        with st.spinner("Generating dbt docs..."):
+            try:
+                db, schema, project_name, task_name, curr_wh = _get_project_and_task(dbt_stage_path)
+                if not curr_wh:
+                    st.error("No active warehouse. Set a warehouse before generating docs.")
+                else:
+                    state, error = _run_dbt_task(task_name, project_name, curr_wh, "docs generate")
+                    if state == "SUCCEEDED":
+                        st.markdown("Docs generated. Fetching artifacts...")
+                        try:
+                            task_short = task_name.split(".")[-1]
+                            qid_row = session.sql("""
+                                SELECT QUERY_ID
+                                FROM TABLE({db}.INFORMATION_SCHEMA.TASK_HISTORY(
+                                    RESULT_LIMIT => 5,
+                                    TASK_NAME => '{task_short}'
+                                ))
+                                WHERE STATE = 'SUCCEEDED'
+                                ORDER BY SCHEDULED_TIME DESC
+                                LIMIT 1
+                            """.format(db=db, task_short=task_short)).collect()
 
-                                if qid_row and qid_row[0]["QUERY_ID"]:
-                                    docs_qid = qid_row[0]["QUERY_ID"]
+                            if qid_row and qid_row[0]["QUERY_ID"]:
+                                docs_qid = qid_row[0]["QUERY_ID"]
 
-                                    docs_stage = f"{db}.{schema}.DBT_DOCS_STAGE"
+                                docs_stage = f"{db}.{schema}.DBT_DOCS_STAGE"
 
-                                    sp_name = f"{db}.{schema}.SP_FETCH_DBT_DOCS"
-                                    session.sql(f"""
-                                        CREATE OR REPLACE PROCEDURE {sp_name}(QID STRING, DOCS_STAGE STRING)
-                                        RETURNS STRING
-                                        LANGUAGE PYTHON
-                                        RUNTIME_VERSION = '3.9'
-                                        PACKAGES = ('snowflake-snowpark-python')
-                                        HANDLER = 'run'
-                                        EXECUTE AS CALLER
-                                        AS
-                                        $$
+                                sp_name = f"{db}.{schema}.SP_FETCH_DBT_DOCS"
+                                session.sql(f"""
+                                    CREATE OR REPLACE PROCEDURE {sp_name}(QID STRING, DOCS_STAGE STRING)
+                                    RETURNS STRING
+                                    LANGUAGE PYTHON
+                                    RUNTIME_VERSION = '3.9'
+                                    PACKAGES = ('snowflake-snowpark-python')
+                                    HANDLER = 'run'
+                                    EXECUTE AS CALLER
+                                    AS
+                                    $$
 import datetime, zipfile, io
 
 def run(session, qid, docs_stage):
@@ -4690,88 +4738,85 @@ def run(session, qid, docs_stage):
         pass
 
     return ts
-                                        $$
-                                    """).collect()
+                                    $$
+                                """).collect()
 
-                                    fetch_task = f"{db}.{schema}.DBT_DOCS_FETCH_TASK"
+                                fetch_task = f"{db}.{schema}.DBT_DOCS_FETCH_TASK"
+                                try:
+                                    session.sql(f"DROP TASK IF EXISTS {fetch_task}").collect()
+                                except Exception:
+                                    pass
+                                session.sql("""
+                                    CREATE OR REPLACE TASK {task}
+                                    WAREHOUSE = {wh}
+                                    AS
+                                    CALL {sp}('{qid}', '{stage}')
+                                """.format(
+                                    task=fetch_task, wh=curr_wh, sp=sp_name,
+                                    qid=docs_qid, stage=docs_stage
+                                )).collect()
+                                session.sql(f"EXECUTE TASK {fetch_task}").collect()
+
+                                time.sleep(5)
+                                fetch_done = False
+                                fetch_error = ""
+                                for _ in range(20):
+                                    time.sleep(3)
                                     try:
-                                        session.sql(f"DROP TASK IF EXISTS {fetch_task}").collect()
-                                    except Exception:
-                                        pass
-                                    session.sql("""
-                                        CREATE OR REPLACE TASK {task}
-                                        WAREHOUSE = {wh}
-                                        AS
-                                        CALL {sp}('{qid}', '{stage}')
-                                    """.format(
-                                        task=fetch_task, wh=curr_wh, sp=sp_name,
-                                        qid=docs_qid, stage=docs_stage
-                                    )).collect()
-                                    session.sql(f"EXECUTE TASK {fetch_task}").collect()
-
-                                    time.sleep(5)
-                                    fetch_done = False
-                                    fetch_error = ""
-                                    for _ in range(20):
-                                        time.sleep(3)
-                                        try:
-                                            fh = session.sql("""
-                                                SELECT STATE, ERROR_MESSAGE
-                                                FROM TABLE({db}.INFORMATION_SCHEMA.TASK_HISTORY(
-                                                    RESULT_LIMIT => 3,
-                                                    TASK_NAME => '{t}'
-                                                ))
-                                                ORDER BY SCHEDULED_TIME DESC LIMIT 1
-                                            """.format(db=db, t=fetch_task.split(".")[-1])).collect()
-                                            if fh and fh[0]["STATE"] == "SUCCEEDED":
-                                                fetch_done = True
-                                                break
-                                            elif fh and fh[0]["STATE"] == "FAILED":
-                                                fetch_error = fh[0].get("ERROR_MESSAGE", "")
-                                                break
-                                        except Exception:
+                                        fh = session.sql("""
+                                            SELECT STATE, ERROR_MESSAGE
+                                            FROM TABLE({db}.INFORMATION_SCHEMA.TASK_HISTORY(
+                                                RESULT_LIMIT => 3,
+                                                TASK_NAME => '{t}'
+                                            ))
+                                            ORDER BY SCHEDULED_TIME DESC LIMIT 1
+                                        """.format(db=db, t=fetch_task.split(".")[-1])).collect()
+                                        if fh and fh[0]["STATE"] == "SUCCEEDED":
+                                            fetch_done = True
                                             break
-
-                                    try:
-                                        session.sql(f"DROP TASK IF EXISTS {fetch_task}").collect()
+                                        elif fh and fh[0]["STATE"] == "FAILED":
+                                            fetch_error = fh[0].get("ERROR_MESSAGE", "")
+                                            break
                                     except Exception:
-                                        pass
+                                        break
 
-                                    if not fetch_done:
-                                        st.warning(f"Could not fetch docs artifacts. {fetch_error}")
-                                    else:
-                                        # Determine the newest version by listing versions/ folder
-                                        try:
-                                            _vlist = session.sql(f"LIST @{docs_stage}/versions/").collect()
-                                            _vdirs = sorted(set(
-                                                r["name"].split("/")[2]
-                                                for r in _vlist
-                                                if len(r["name"].split("/")) > 2
-                                            ), reverse=True)
-                                            _new_version = _vdirs[0] if _vdirs else None
-                                        except Exception as _vle:
-                                            _new_version = None
-                                            st.warning(f"Could not list versions folder: {_vle}")
+                                try:
+                                    session.sql(f"DROP TASK IF EXISTS {fetch_task}").collect()
+                                except Exception:
+                                    pass
 
-                                        # Persist stage coordinates for the viewer
-                                        st.session_state.dbt_docs_stage  = docs_stage
-                                        st.session_state.dbt_docs_db     = db
-                                        st.session_state.dbt_docs_schema = schema
-                                        if "dbt_docs_cache" not in st.session_state:
-                                            st.session_state.dbt_docs_cache = {}
+                                if not fetch_done:
+                                    st.warning(f"Could not fetch docs artifacts. {fetch_error}")
+                                else:
+                                    try:
+                                        _vlist = session.sql(f"LIST @{docs_stage}/versions/").collect()
+                                        _vdirs = sorted(set(
+                                            r["name"].split("/")[2]
+                                            for r in _vlist
+                                            if len(r["name"].split("/")) > 2
+                                        ), reverse=True)
+                                        _new_version = _vdirs[0] if _vdirs else None
+                                    except Exception as _vle:
+                                        _new_version = None
+                                        st.warning(f"Could not list versions folder: {_vle}")
 
-                                        # ── Helper SP: reads any stage file via SnowflakeFile ──
-                                        _read_sp = f"{db}.{schema}.SP_READ_STAGE_FILE"
-                                        session.sql(f"""
-                                            CREATE OR REPLACE PROCEDURE {_read_sp}(STAGE_NAME STRING, REL_PATH STRING)
-                                            RETURNS STRING
-                                            LANGUAGE PYTHON
-                                            RUNTIME_VERSION = '3.9'
-                                            PACKAGES = ('snowflake-snowpark-python')
-                                            HANDLER = 'run'
-                                            EXECUTE AS CALLER
-                                            AS
-                                            $$
+                                    st.session_state.dbt_docs_stage  = docs_stage
+                                    st.session_state.dbt_docs_db     = db
+                                    st.session_state.dbt_docs_schema = schema
+                                    if "dbt_docs_cache" not in st.session_state:
+                                        st.session_state.dbt_docs_cache = {}
+
+                                    _read_sp = f"{db}.{schema}.SP_READ_STAGE_FILE"
+                                    session.sql(f"""
+                                        CREATE OR REPLACE PROCEDURE {_read_sp}(STAGE_NAME STRING, REL_PATH STRING)
+                                        RETURNS STRING
+                                        LANGUAGE PYTHON
+                                        RUNTIME_VERSION = '3.9'
+                                        PACKAGES = ('snowflake-snowpark-python')
+                                        HANDLER = 'run'
+                                        EXECUTE AS CALLER
+                                        AS
+                                        $$
 def run(session, stage_name, rel_path):
     scoped = session.sql(
         f"SELECT BUILD_SCOPED_FILE_URL(@{{stage_name}}, '{{rel_path}}')"
@@ -4779,107 +4824,108 @@ def run(session, stage_name, rel_path):
     from snowflake.snowpark.files import SnowflakeFile
     with SnowflakeFile.open(scoped, 'rb') as fh:
         return fh.read().decode('utf-8', errors='replace')
-                                            $$
-                                        """).collect()
-                                        st.session_state.dbt_docs_read_sp = _read_sp
+                                        $$
+                                    """).collect()
+                                    st.session_state.dbt_docs_read_sp = _read_sp
 
-                                        _read_errors = []
+                                    _read_errors = []
 
-                                        def _read_stage_text(rel_path, default="{}"):
-                                            try:
-                                                result = session.sql(
-                                                    f"CALL {_read_sp}('{docs_stage}', '{rel_path}')"
-                                                ).collect()[0][0]
-                                                return result if result else default
-                                            except Exception as _re:
-                                                _read_errors.append(f"{rel_path}: {_re}")
-                                                return default
+                                    def _read_stage_text(rel_path, default="{}"):
+                                        try:
+                                            result = session.sql(
+                                                f"CALL {_read_sp}('{docs_stage}', '{rel_path}')"
+                                            ).collect()[0][0]
+                                            return result if result else default
+                                        except Exception as _re:
+                                            _read_errors.append(f"{rel_path}: {_re}")
+                                            return default
 
-                                        def _load_version_html(ver_prefix):
-                                            """Load and render docs HTML for a given stage path prefix."""
-                                            _files = [
-                                                r.as_dict() for r in
-                                                session.sql(f"LIST @{docs_stage}/{ver_prefix}/").collect()
-                                            ]
-                                            _fmap = {}
-                                            for _f in _files:
-                                                _fn = _f.get("name", "")
-                                                _rel = "/".join(_fn.split("/")[1:])
-                                                _fmap[_rel] = _rel
+                                    def _load_version_html(ver_prefix):
+                                        _files = [
+                                            r.as_dict() for r in
+                                            session.sql(f"LIST @{docs_stage}/{ver_prefix}/").collect()
+                                        ]
+                                        _fmap = {}
+                                        for _f in _files:
+                                            _fn = _f.get("name", "")
+                                            _rel = "/".join(_fn.split("/")[1:])
+                                            _fmap[_rel] = _rel
 
-                                            _manifest = "{}"
-                                            _catalog  = "{}"
-                                            _html     = ""
+                                        _manifest = "{}"
+                                        _catalog  = "{}"
+                                        _html     = ""
 
-                                            for _mk in [f"{ver_prefix}/manifest.json", f"{ver_prefix}/target/manifest.json"]:
-                                                if _mk in _fmap:
-                                                    _manifest = _read_stage_text(_mk)
-                                                    break
-                                            for _ck in [f"{ver_prefix}/catalog.json", f"{ver_prefix}/target/catalog.json"]:
-                                                if _ck in _fmap:
-                                                    _catalog = _read_stage_text(_ck)
-                                                    break
-                                            if f"{ver_prefix}/index.html" in _fmap:
-                                                _html = _read_stage_text(f"{ver_prefix}/index.html", default="")
+                                        for _mk in [f"{ver_prefix}/manifest.json", f"{ver_prefix}/target/manifest.json"]:
+                                            if _mk in _fmap:
+                                                _manifest = _read_stage_text(_mk)
+                                                break
+                                        for _ck in [f"{ver_prefix}/catalog.json", f"{ver_prefix}/target/catalog.json"]:
+                                            if _ck in _fmap:
+                                                _catalog = _read_stage_text(_ck)
+                                                break
+                                        if f"{ver_prefix}/index.html" in _fmap:
+                                            _html = _read_stage_text(f"{ver_prefix}/index.html", default="")
 
-                                            if not _html:
-                                                return None
+                                        if not _html:
+                                            return None
 
-                                            _inject = (
-                                                "<script>\n(function(){\n"
-                                                "  var _manifest=" + _manifest + ";\n"
-                                                "  var _catalog="  + _catalog  + ";\n"
-                                                "  var _oF=window.fetch;\n"
-                                                "  window.fetch=function(u,o){var s=(typeof u==='string')?u:(u&&u.url)||'';\n"
-                                                "    if(s.indexOf('manifest.json')!==-1) return Promise.resolve(new Response(JSON.stringify(_manifest),{status:200,headers:{'Content-Type':'application/json'}}));\n"
-                                                "    if(s.indexOf('catalog.json')!==-1)  return Promise.resolve(new Response(JSON.stringify(_catalog), {status:200,headers:{'Content-Type':'application/json'}}));\n"
-                                                "    return _oF?_oF.apply(this,arguments):Promise.reject(new Error('no fetch'));};\n"
-                                                "  var _oO=XMLHttpRequest.prototype.open,_oS=XMLHttpRequest.prototype.send;\n"
-                                                "  XMLHttpRequest.prototype.open=function(m,u){this._u=u||'';return _oO.apply(this,arguments);};\n"
-                                                "  XMLHttpRequest.prototype.send=function(){var self=this,u=this._u||'';\n"
-                                                "    if(u.indexOf('manifest.json')!==-1||u.indexOf('catalog.json')!==-1){\n"
-                                                "      var d=(u.indexOf('manifest.json')!==-1)?_manifest:_catalog,b=JSON.stringify(d);\n"
-                                                "      setTimeout(function(){Object.defineProperty(self,'status',{value:200});Object.defineProperty(self,'readyState',{value:4});\n"
-                                                "        Object.defineProperty(self,'responseText',{value:b});Object.defineProperty(self,'response',{value:b});\n"
-                                                "        if(self.onreadystatechange)self.onreadystatechange();if(self.onload)self.onload();},0);return;}\n"
-                                                "    return _oS.apply(this,arguments);}\n"
-                                                "})();\n</script>"
-                                            )
-                                            if '<head>' in _html:
-                                                return _html.replace('<head>', '<head>' + _inject, 1)
-                                            elif '<HEAD>' in _html:
-                                                return _html.replace('<HEAD>', '<HEAD>' + _inject, 1)
-                                            return _inject + _html
+                                        _inject = (
+                                            "<script>\n(function(){\n"
+                                            "  var _manifest=" + _manifest + ";\n"
+                                            "  var _catalog="  + _catalog  + ";\n"
+                                            "  var _oF=window.fetch;\n"
+                                            "  window.fetch=function(u,o){var s=(typeof u==='string')?u:(u&&u.url)||'';\n"
+                                            "    if(s.indexOf('manifest.json')!==-1) return Promise.resolve(new Response(JSON.stringify(_manifest),{status:200,headers:{'Content-Type':'application/json'}}));\n"
+                                            "    if(s.indexOf('catalog.json')!==-1)  return Promise.resolve(new Response(JSON.stringify(_catalog), {status:200,headers:{'Content-Type':'application/json'}}));\n"
+                                            "    return _oF?_oF.apply(this,arguments):Promise.reject(new Error('no fetch'));};\n"
+                                            "  var _oO=XMLHttpRequest.prototype.open,_oS=XMLHttpRequest.prototype.send;\n"
+                                            "  XMLHttpRequest.prototype.open=function(m,u){this._u=u||'';return _oO.apply(this,arguments);};\n"
+                                            "  XMLHttpRequest.prototype.send=function(){var self=this,u=this._u||'';\n"
+                                            "    if(u.indexOf('manifest.json')!==-1||u.indexOf('catalog.json')!==-1){\n"
+                                            "      var d=(u.indexOf('manifest.json')!==-1)?_manifest:_catalog,b=JSON.stringify(d);\n"
+                                            "      setTimeout(function(){Object.defineProperty(self,'status',{value:200});Object.defineProperty(self,'readyState',{value:4});\n"
+                                            "        Object.defineProperty(self,'responseText',{value:b});Object.defineProperty(self,'response',{value:b});\n"
+                                            "        if(self.onreadystatechange)self.onreadystatechange();if(self.onload)self.onload();},0);return;}\n"
+                                            "    return _oS.apply(this,arguments);}\n"
+                                            "})();\n</script>"
+                                        )
+                                        if '<head>' in _html:
+                                            return _html.replace('<head>', '<head>' + _inject, 1)
+                                        elif '<HEAD>' in _html:
+                                            return _html.replace('<HEAD>', '<HEAD>' + _inject, 1)
+                                        return _inject + _html
 
-                                        _rendered = _load_version_html(f"versions/{_new_version}") if _new_version else None
-                                        if _rendered:
-                                            st.session_state.dbt_docs_cache[_new_version] = _rendered
-                                            st.session_state.dbt_docs_html = _rendered
+                                    _rendered = _load_version_html(f"versions/{_new_version}") if _new_version else None
+                                    if _rendered:
+                                        st.session_state.dbt_docs_cache[_new_version] = _rendered
+                                        st.session_state.dbt_docs_html = _rendered
 
-                                        if st.session_state.get("dbt_docs_html"):
-                                            st.success("dbt docs ready! See the **dbt Docs Viewer** below.")
-                                            st.download_button(
-                                                label="⬇️ Download dbt Docs HTML (open in browser)",
-                                                data=st.session_state.dbt_docs_html.encode("utf-8"),
-                                                file_name=f"dbt_docs_{_new_version}.html",
-                                                mime="text/html",
-                                                key="dl_docs_after_gen",
-                                            )
-                                        else:
-                                            st.session_state.dbt_docs_html = None
-                                            st.warning("index.html not found in artifacts. Check stage manually.")
-                                else:
-                                    st.warning("Could not find query ID for docs generation.")
-                            except Exception as doc_err:
-                                st.session_state.dbt_docs_html = None
-                                st.warning(f"Docs generated but could not load artifacts: {doc_err}")
-                                st.info("Run `SELECT SYSTEM$LOCATE_DBT_ARTIFACTS('<query_id>')` manually.")
-                        elif state == "TIMEOUT":
-                            st.warning("Docs generation still running. Check Snowflake task history.")
-                        else:
-                            st.error(f"dbt docs failed [{state}]: {error}")
-                except Exception as e:
-                    st.error(str(e))
+                                    if st.session_state.get("dbt_docs_html"):
+                                        st.success("dbt docs ready! See the **dbt Docs Viewer** below.")
+                                        st.download_button(
+                                            label="⬇️ Download dbt Docs HTML (open in browser)",
+                                            data=st.session_state.dbt_docs_html.encode("utf-8"),
+                                            file_name=f"dbt_docs_{_new_version}.html",
+                                            mime="text/html",
+                                            key="dl_docs_after_gen",
+                                        )
+                                    else:
+                                        st.session_state.dbt_docs_html = None
+                                        st.warning("index.html not found in artifacts. Check stage manually.")
+                            else:
+                                st.warning("Could not find query ID for docs generation.")
+                        except Exception as doc_err:
+                            st.session_state.dbt_docs_html = None
+                            st.warning(f"Docs generated but could not load artifacts: {doc_err}")
+                            st.info("Run `SELECT SYSTEM$LOCATE_DBT_ARTIFACTS('<query_id>')` manually.")
+                    elif state == "TIMEOUT":
+                        st.warning("Docs generation still running. Check Snowflake task history.")
+                    else:
+                        st.error(f"dbt docs failed [{state}]: {error}")
+            except Exception as e:
+                st.error(str(e))
+            finally:
+                st.session_state["_exec_docs"] = False
 
     # ── dbt Docs Viewer ──────────────────────────────────────────────────────
     if st.session_state.get("dbt_docs_html") and st.session_state.get("dbt_docs_stage"):
